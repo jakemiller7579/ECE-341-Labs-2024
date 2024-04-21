@@ -1,0 +1,212 @@
+#include <plib.h>
+#include "PWM.h"
+#include "LCDLIB.h"
+#include "CerebotMX7cK.h"
+#include <stdio.h>
+#include <string.h>
+#define MTR_SA BIT_9
+#define MTR_SB BIT_10
+#define PI 3.14159265358979323846
+void IC_init();
+
+//global variables
+int PR; 
+int DC=40;
+
+float RPS=10.222; //Input capture global var (rev per second)
+
+int main()
+{
+    int freq=1000;
+    pwm_init(DC,freq);
+    char rpsstr[16];
+    //LCD init with function added to position lCD cursor at any position
+    while(1)
+    {
+        sw_msDelay(100);
+        mCNIntEnable(0); // Disable CN interrupts
+        clearLineLCD(2);//clears 2nd line
+        sprintf(rpsstr,"RPS=%.2f",RPS);
+        LCD_puts(rpsstr);
+        mCNIntEnable(1); // Enable CN interrupts
+    }
+} 
+
+//CN ISR:
+void __ISR(_CHANGE_NOTICE_VECTOR, IPL1) CNIntHandler(void)
+{
+    char str[10];
+	mCNClearIntFlag(); // Macro function--Clear IF
+	LATBSET=LEDB;
+	sw_msDelay(ISRWait); //Wait for de-bounce
+    
+    //Read BTN1 and BTN2 in PortG
+    unsigned int buttons=mPORTGReadBits(BTN1 | BTN2);
+    
+    //decode buttons
+    switch(buttons)
+	{
+		default:  //40%
+            DC=40;
+			break;
+			
+		case BTN1:   //65%
+            DC=65;
+			break;
+			
+		case BTN2:   //80%
+            DC=80;
+			break;
+			
+		case (BTN1 | BTN2):   //95%
+            DC=95;
+			break;			
+	}
+    writeLCD(0, 0x80);
+    sprintf(str,"PWM=%2d%%\n",DC);
+    LCD_puts(str);
+    pwm_set(DC);
+	mCNClearIntFlag(); // Macro function--Clear IF
+	LATBCLR=LEDB;
+}
+
+
+//T2 ISR
+void __ISR(_TIMER_2_VECTOR, IPL2) Timer2Handler(void)
+{
+	mT2ClearIntFlag(); // Clear the interrupt flag
+ 	LATBINV=LEDA;      //FLICKER LEDA
+    mT2ClearIntFlag();
+}
+
+int pwm_set(int dutyCycle)
+{
+    if ((dutyCycle<0) | (dutyCycle>100))
+    {
+        return 1;
+    }
+    OC3RS=(dutyCycle*(PR+1)/100);
+    SetDCOC3PWM(OC3RS);
+    return 0;
+} 
+
+int pwm_init(int dutyCycle, int cycleFrequency)
+{
+    Cerebot_mx7cK_setup();
+    initBits();
+    
+    if ((dutyCycle<0) | (dutyCycle>100))
+    {
+        return 1;
+    }
+     
+//    int OC3R;
+    PR=(FPB/cycleFrequency)-1;
+    OC3RS=(dutyCycle*(PR+1)/100);
+    mOC3ClearIntFlag(); // Clear output compare interrupt flag (not using this interrupt)
+    //Timer and Interrupt Initialization
+	OpenTimer2(T2_ON | T2_SOURCE_INT | T2_PS_1_1, PR);
+    OpenOC3(OC_configure_bits, OC3RS,OC3RS );
+    // Setup processor board
+    ISRINIT();
+    PMP_init();
+    LCD_init(); 
+    T3_init();
+    IC_init();
+
+    
+    pwm_set(dutyCycle);
+    LCD_puts("PWM=40%\n");
+    return 0;
+}
+
+
+void __ISR(_INPUT_CAPTURE_5_VECTOR, ipl3) Capture5(void)
+{
+    static unsigned int con_buf[4]; //declare an input capture buffer
+    //Declare three time capture variables
+    static unsigned short int t_new; //most recent captured time
+    static unsigned short int t_old=0; //previous time capture
+    static unsigned short int time_diff;//time between captures
+    static unsigned short int 
+    
+    LATBINV=LEDD; //Toggle LEDD on each input capture interrupt
+    ReadCapture5(con_buf); //read captures into buffer
+    t_new=con_buf[0]; //save time of event
+    time_diff=t_new-t_old; //compute elapsed time in timer ticks
+    t_old=t_new; //replace previous time capture with new
+    //compute motor speed in RPS (revolutions per second) and save as a global variable
+    
+    //ticks convert to seconds
+    static unsigned short int time_diffsec=(time_diff*1000)/(COUNTS_PER_MS);
+    static unsigned short int omega=(2*PI)/time_diffsec;
+    mIC5ClearIntFlag(); //could also use INTClearFlag(INT_IC5);
+}
+
+void T3_init()
+{ //Timer 3 
+    OpenTimer3(T3_ON | T3_SOURCE_INT | T3_PS_1_256, 0xFFFF);
+    mT3SetIntPriority(2); // Group priority range: 1 to 7
+    mT3SetIntSubPriority(2); // Subgroup priority range: 0 to 3
+    mT3IntEnable(1); //enable t3
+}
+
+void __ISR(_TIMER_3_VECTOR, IPL3) Timer3Handler(void)
+{
+    LATBINV=LEDC;
+    mT3ClearIntFlag();
+}
+
+void IC_init()
+{
+    unsigned int c1, c2, c3, c4, c5, c6, c7, ic1, ic2, ic3;
+    c1=IC_ON; //Enable input capture
+    c2=IC_CAP_16BIT; //Capture 16 bit timer count
+    c3=IC_IDLE_STOP; //Stop input capture during debug
+    c4=IC_FEDGE_FALL; //Initial capture on falling edge
+    c5=IC_TIMER3_SRC; //Use Timer 3 as time to capture
+    c6=IC_INT_1CAPTURE; //Generate interrupt on each capture
+    c7= IC_EVERY_FALL_EDGE; //capture time on each falling edge
+    OpenCapture5(c1 |c2 | c3 | c4 | c5 | c6 | c7);
+    
+    ic1=IC_INT_ON;//Enable IC interrupt
+    ic2=IC_INT_PRIOR_3; //priority lvl 3
+    ic3=IC_INT_SUB_PRIOR_0; //sub priority lvl 0
+    ConfigIntCapture5(ic1 | ic2 |ic3);
+}
+
+void initBits()
+{
+    //I/O Bits Cleared and Set
+    PORTSetPinsDigitalIn(IOPORT_G,(BTN1 | BTN2));// INPUT TO BUTTONS
+    PORTSetPinsDigitalOut(IOPORT_D,BIT_7); //OUTPUT TO DC MOTOR
+    PORTSetPinsDigitalOut(IOPORT_B,LEDS);
+    LATBCLR=LEDS; 
+    LATDCLR = BIT_7;/* Clear values */
+    
+    PORTSetPinsDigitalIn(IOPORT_D,(MTR_SA |MTR_SB));//Input Capture
+}
+
+
+void ISRINIT()
+{
+    //T2 INT Priorities:
+    mT2SetIntPriority(2); // Group priority range: 1 to 7
+    mT2SetIntSubPriority(0); // Subgroup priority range: 0 to 3
+    
+    //CN INT Priorities: 
+	mCNOpen(CN_ON,(CN8_ENABLE | CN9_ENABLE), 0); //CN Interrupt every time BTN pressed
+	mCNSetIntPriority(1); // CN priority (1 to 7)
+	mCNSetIntSubPriority(0); // CN Subgroup priority (0 to 3)
+    
+    //Clear port and flags
+	unsigned int dummy = PORTReadBits(IOPORT_G, BTN1 | BTN2); //read port to clear differences
+	mT2ClearIntFlag();//CLEAR T1 INTERUPT FLAG TIMER1
+    mCNClearIntFlag();//CLEAR CN INTERUPT FLAG TIMER1
+    
+    //Enable CN and T2 INT
+	INTEnableSystemMultiVectoredInt();
+    mT2IntEnable(1);
+	mCNIntEnable(1); // Enable CN interrupts
+}
+
